@@ -1,0 +1,637 @@
+---
+title: "Multi-Omics Integration Analysis - MOFA"
+author: "Adam El Idrissi"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+  pdf_document:
+    latex_engine: xelatex
+    toc: true
+    number_sections: false
+---
+
+
+
+
+# Practical overview
+
+This R Markdown document preserves the workflow and execution order of the supplied MOFA.R script, applied in the same dataset we analysed previously. This document contains detailed descriptions of the code cells and the resulting outputs in relation to the dataset used in this practical. It provides an overview of the multi-omics integration process performed using `Multi-Omics Factor Analysis (MOFA)`. The official MOFA2 tutorials, available at `https://biofam.github.io/MOFA2/tutorials.html`, which provides additional examples of model training and downstream analysis.
+
+MOFA utilizes Matrix Factorization framework for the unsupervised integration of multiple omics datasets. It learns an interpretable, low-dimensional representation of the integrated data through a set of latent factors. These factors capture the major sources of variation across the analysed omics modalities and can subsequently be examined in relation to sample groups, biological characteristics, and influential molecular features.
+
+------------------------------------------------------------------------
+
+# 1. Package installation and loading
+
+The required packages are obtained from both CRAN and Bioconductor repositories, with `MOFA2` installed through `BiocManager`. `MOFA2` is the main package used for multi-omics integration in this practical. `basilisk` is used to manage the Python environment and dependencies required by the MOFA2 implementation. In this workflow, this environment is accessed explicitly when the model is trained using `run_mofa(..., use_basilisk = TRUE)`. The stable Bioconductor installation of MOFA2 uses `basilisk` to configure the required Python environment automatically. `edgeR` is used to process the RNA-seq count matrix before integration. `data.table`, `dplyr`, and `tidyr` are loaded for dataframes manipulation.
+
+```{r package-loading}
+
+
+########## MOFA ################################################################
+
+## Load all the required libraries 
+# BiocManager::install("MOFA2")
+
+
+library(MOFA2)
+library(data.table)
+library(ggplot2)
+library(dplyr)
+library(psych)
+library(GGally)
+library(ggplot2)
+library(ggpubr)
+library(tidyr)
+library(basilisk)
+library(edgeR)
+
+```
+
+------------------------------------------------------------------------
+
+# 2. Load the RNA-seq, methylation, and metadata files
+
+Boar taint is one of the most extensively studied phenotypes in swine production. It is characterized by an unpleasant urine- or feces-like odor and flavour that is released during the cooking of meat from uncastrated male pigs. Based on the intensity of this phenotype, the animals included in this study were classified into three groups: Low, Medium, and High boar taint.
+
+Our two datasets originate from the 3 groups of boars, differentiated by their taints (Low - Medium - High taint), where one dataset contains Liver RNA-seq measurements and the other contains Methylation measurements. The RNA matrix consists of 75,375 genes measured across 9 boars (3 from each phenotypes), whereas the methylation matrix contains 100,000 methylation observations measured from the same 9 boars (3 from each phenotypes). For vertical integration using the MOFA framework, it is essential that the same biological samples are shared across all omics modalities. In our case, the nine boars were profiled at different molecular levels, allowing the integration of transcriptomic and methylation information from the same individuals.
+
+```{r data-import}
+##### load all the required files and arrange the files for MOFA Analysis
+RNA_Seq_Data=read.csv("RNA_Seq_Liver.csv", row.names = 1)
+head(RNA_Seq_Data)[1:5]
+
+
+Methylation=read.csv("Epigenetic_matrix_filtered_100000.csv", row.names = 1)
+rownames(Methylation)=Methylation$region
+Methylation$X=NULL
+Methylation$region =NULL
+
+head(Methylation)
+
+metadat_columns=read.csv("Metadata.csv")
+head(metadat_columns)
+metadat_columns$X=NULL
+
+```
+
+------------------------------------------------------------------------
+
+# 3. Metadata filtering and sample alignment
+
+The metadata file contains the identifiers of each boar together with its corresponding boar taint phenotype (Low, Medium, or High). In this step, the metadata are prepared to be compatible with the MOFA integration framework. One important concept during multi-omics integration is `shared samples measurements`. This means that the samples measurements from the individuals must be compatible across all other modalities. For example, if Dataset A contains the samples identifiers as ID1, ID2, ID3, then Dataset B and Dataset C must also contain the same identifier (ID1, ID2, ID3). Any mismatch in the sample naming would result in non-functioning data fusion, and consequently biasing the results outcome.
+
+```{r metadata-filtering}
+###################### Metadata Filtering ######################################
+# Add prefix based on boar taint group
+metadat_columns$SampleName <- ifelse(
+  grepl("high", metadat_columns$Group, ignore.case = TRUE), 
+  paste0("H", metadat_columns$SampleID),
+  ifelse(
+    grepl("medium", metadat_columns$Group, ignore.case = TRUE), 
+    paste0("M", metadat_columns$SampleID),
+    ifelse(
+      grepl("low", metadat_columns$Group, ignore.case = TRUE), 
+      paste0("L", metadat_columns$SampleID),
+      paste0("X", metadat_columns$SampleID)  # fallback if none match
+    )
+  )
+)
+metadat_columns$Group <- sub(" .*", "", metadat_columns$Group)
+
+
+
+# Create the old and new column name mapping
+metadat_columns$OldSampleName <- paste0("X", metadat_columns$SampleID)  # Original names
+name_map <- setNames(metadat_columns$SampleName, metadat_columns$OldSampleName)  # Named vector: old -> new
+# Rename methylation matrix columns
+common_meth_cols <- intersect(colnames(Methylation), names(name_map))
+colnames(Methylation)[match(common_meth_cols, colnames(Methylation))] <- name_map[common_meth_cols]
+# Rename RNA-seq matrix columns
+common_rna_cols <- intersect(colnames(RNA_Seq_Data), names(name_map))
+colnames(RNA_Seq_Data)[match(common_rna_cols, colnames(RNA_Seq_Data))] <- name_map[common_rna_cols]
+# Update metadata rownames to match new names
+rownames(metadat_columns) <- metadat_columns$SampleName
+# Filter metadata to keep only samples present in your omics data
+omics_samples <- colnames(Methylation)  
+sample_metadata <- metadat_columns[metadat_columns$SampleName %in% omics_samples, ]
+
+
+# Double-check that sample orders match
+all(colnames(RNA_Seq_Data) == colnames(Methylation))
+# Reorder columns of methylation matrix to match RNA-seq
+meth_matrix <- Methylation[, colnames(RNA_Seq_Data)]
+####### Check that they're now aligned
+all(colnames(meth_matrix) == colnames(RNA_Seq_Data))  # should return TRUE
+
+## Change the colnames of metadata
+colnames(sample_metadata)[colnames(sample_metadata) == "SampleName"] <- "sample"
+colnames(sample_metadata)[colnames(sample_metadata) == "Group"] <- "group"
+
+```
+
+------------------------------------------------------------------------
+
+# 4. Normalize and filter the RNA-seq data
+
+Before integrating the transcriptomic data with any other data modality, the RNA-seq counts must be normalized to create a stable distribution. The raw count matrix are initially pre-processed by removing lowly expressed genes using `filterByExpr()`. Normalization factors are then estimated with `calcNormFactors()` for batch to batch estimation and false positive/negative results, and the counts are transformed into log<sub>2</sub> Counts Per Million (CPM) values using a prior count to avoid undefined values produced by log(0) (mathematically undefined real number). The final processed RNA-seq data leaves with 9 boars and the top 5000 most variable genes.
+
+```{r rna-normalization}
+########### Normalize and filter for downstream analysis #######################
+
+# Create DGEList object
+dge <- DGEList(counts = RNA_Seq_Data)
+keep <- filterByExpr(dge)  
+dge <- dge[keep, , keep.lib.sizes=FALSE]
+# Normalize with TMM
+dge <- calcNormFactors(dge)
+# Log2-CPM transformation
+log_RNA <- cpm(dge, log = TRUE, prior.count = 1)
+# Filter top 3000 most variable genes
+gene_var <- apply(log_RNA, 1, var)
+top_genes <- names(sort(gene_var, decreasing = TRUE))[1:5000]
+log_RNA_filtered <- log_RNA[top_genes, ]
+
+dim(gene_var)
+dim(log_RNA_filtered)
+
+```
+
+------------------------------------------------------------------------
+
+# 5. Transform and filter the methylation data
+
+Before integrating the methylation data with any other data modalities, in the same process of RNA-seq, methylation data is subject to pre-processing. The data are first converted into a numeric matrix, after which the methylation β-values are transformed into M-values using a logit transformatiion. This transformation is presented as log2 ratio transformation of the intensities methylated probes vs unmethylated probes. The reference of this transformation is in the following paper `https://pmc.ncbi.nlm.nih.gov/articles/PMC3012676/`. To improve data quality, methylation sites with more than 20% missing values are removed, and samples exceeding the same missingness threshold are also excluded. The final outcome of the methylation dataset is 5000 methylated regions in 9 candidate boars.
+
+```{r methylation-filtering}
+### Methylation data
+# Ensure beta values are in [0, 1]
+Methylation[Methylation <= 0] <- 0
+Methylation[Methylation >= 1] <- 1 
+summary(Methylation)
+# Convert data frame to numeric matrix
+Methylation <- as.matrix(Methylation)
+summary(Methylation)
+storage.mode(Methylation) <- "numeric"  # make sure all values are numeric
+# Convert to M-values
+Mval <- log2(Methylation / (1 - Methylation))
+# Replace Inf and -Inf with NA safely
+Mval[is.infinite(Mval)] <- NA
+class(Mval)
+# keep features with <20% NA
+clean_meth <- Mval[apply(Mval, 1, function(x) sum(is.na(x)) < length(x) * 0.2), ]  
+clean_meth <- clean_meth[, colSums(is.na(clean_meth)) < nrow(clean_meth) * 0.2]
+
+# Calculate variance per CpG (row), ignoring NAs
+var_per_cpg <- apply(clean_meth, 1, var, na.rm = TRUE)
+# Sort CpGs by variance decreasing and get top 5000 CpGs
+top_CPGs <- names(sort(var_per_cpg, decreasing = TRUE))[1:5000]
+# Subset methylation data to top variable CpGs
+Meth_view <- clean_meth[top_CPGs, ]
+# Check dimensions
+dim(Meth_view)
+# Confirm shared sample names
+common_samples <- intersect(colnames(log_RNA_filtered), colnames(Meth_view))
+
+
+
+```
+
+------------------------------------------------------------------------
+
+# 6. Prepare the multi-omics data views
+
+Before constructing the MOFA model, the RNA-seq and methylation datasets must contain the same biological samples in the same column order. The object common_samples, defined in the previous step, contains the sample identifiers shared by both omics datasets. The RNA-seq matrix is therefore subset using log_RNA_filtered[, common_samples], while the methylation matrix is subset using Meth_view[, common_samples]. This operation has two purposes. First, it removes any sample that is not present in both datasets. Second, it ensures that corresponding columns in the two matrices refer to the same biological individual. For example, the first column of RNA_view and the first column of Meth_view must represent the same sample. This alignment is essential because MOFA integrates information measured across the same set of samples.
+
+The two processed datasets are then stored in the named list multi_omics_data. Each element of this list represents a separate omics view: - RNAseq contains the filtered and normalized RNA-seq data. - Methylation contains the filtered methylation M-values.
+
+The function as.matrix() converts each object into a numeric matrix before it is supplied to MOFA. In both matrices, rows represent molecular features and columns represent samples. The RNA-seq matrix therefore contains genes in rows, whereas the methylation matrix contains CpG regions or methylation features in rows. It is important to note that the datasets are not merged into a single dataframe. Instead, they remain as separate matrices within the same list. This preserves the identity of each omics modality and allows MOFA to model variation within and across the RNA-seq and methylation views.
+
+```{r multi-omics-data}
+# Subset and reorder both datasets to same sample order
+RNA_view <- log_RNA_filtered[, common_samples]
+Meth_view <- Meth_view[, common_samples]
+
+
+
+# Build multi-omics data list (9 sample names in columns, rows have RNASeq in one object, 
+# similarly in a separate object another list with the CpG data)- They are NOT merged in a single object or data frame.
+multi_omics_data <- list(
+  RNAseq = as.matrix(RNA_view),
+  Methylation = as.matrix(Meth_view)
+)
+
+head(multi_omics_data$RNAseq)
+head(multi_omics_data$Methylation)
+
+
+```
+
+------------------------------------------------------------------------
+
+# 7. Create, prepare, and train the MOFA model
+
+## Construction and training of the MOFA model
+
+The two aligned omics views are used to construct the initial MOFA object with `create_mofa()`. The resulting object contains the RNA-seq and methylation matrices together with the sample-group assignments supplied through `groups = sample_metadata$group`. At this stage, the model has not yet been trained; the function only organizes the input data into the structure required by MOFA2. The `plot_data_overview()` function provides a visual summary of the input structure. It provides the number of datasets that we're currently willing to train, the sample numbers, MOFA is an unsupervised factor-analysis framework. It aims to represent the integrated datasets using a smaller number of latent factors. Each factor captures a source of variation that may be specific to one omics view or shared across multiple views. In this practical, the factors are inferred jointly from the RNA-seq and methylation data rather than being constructed to predict the Low, Medium, and High boar-taint classes.
+
+The parameter `model_opts$num_factors <- 3` requests the estimation of three latent factors. These factors provide three independent dimensions through which the principal patterns of variability in the RNA-seq and methylation datasets can be summarized. The number of factors is specified before training and should be interpreted in relation to the amount of variance explained by each factor during downstream analysis. The MOFA documentation states that there is no universally optimal number of factors because the appropriate choice depends on the objective, dimensions, and complexity of the analysis.
+
+The `prepare_mofa()` function combines the selected data, model, and training options with the initial MOFA object. This preparation step checks and configures the object before model fitting. The sample metadata and groups are not supplied again because they were already incorporated when `create_mofa()` was called. Finally, `run_mofa()` trains the prepared model. The output file path is defined as `model.hdf5` within the current working directory. The HDF5 file stores the trained model and its learned parameters. Setting `use_basilisk = TRUE` instructs MOFA2 to use the Python environment managed through `basilisk`. For a clearer understanding of the integration, we invite you to look at the general framework in: `https://biofam.github.io/MOFA2/`.
+
+```{r mofa-training}
+# Create MOFA object with groups specified explicitly - it now access the list 
+mofa_object <- create_mofa(multi_omics_data, groups = sample_metadata$group)
+plot_data_overview(mofa_object)
+
+# Prepare options
+data_opts <- get_default_data_options(mofa_object)
+model_opts <- get_default_model_options(mofa_object)
+train_opts <- get_default_training_options(mofa_object)
+train_opts$seed <- 42  # for reproducibility
+train_opts$maxiter <- 1000
+model_opts$num_factors <- 3
+train_opts$convergence_mode <- "medium"
+
+
+
+# Prepare the model (NO samples_metadata or groups arguments here)
+mofa_object <- prepare_mofa(
+  object = mofa_object,
+  data_options = data_opts,
+  model_options = model_opts,
+  training_options = train_opts
+)
+
+# Run MOFA
+outfile = file.path(getwd(),"model.hdf5")
+mofa_trained <- run_mofa(mofa_object,outfile, use_basilisk = TRUE)
+
+```
+
+------------------------------------------------------------------------
+
+# 8. Inspect variance explained by the trained model
+
+The first step in the MOFA analysis is to quantify the amount of variance explained (R2) by each factor in each data modality. The variance explained estimates are stored in the hdf5 file and loaded in `mofa_trained@cache$variance_explained$r2_per_factor[[1]]`. As observed, RNA-seq liver data has an important cumulative variance explained of 52 % and methylation data of 32.43 % among the three observed factors. We will inspect in the future cells the biomarkers driven by the Views (Modalities) across groups differentiation.
+
+```{r variance-explained}
+# -----------------------------------
+# Downstream Analysis & Visualization
+# -----------------------------------
+
+### Check the Number of features according to groups
+plot_data_overview(mofa_trained)
+# Total variance explained per Omics 
+print(mofa_trained@cache$variance_explained$r2_total[[1]])
+# Variance explained by each factor per view 
+head(mofa_trained@cache$variance_explained$r2_per_factor[[1]])
+###Plot variance 
+plot_variance_explained(mofa_trained, x="view", y="factor") # Modality
+plot_variance_explained(mofa_trained, x="group", y="factor", plot_total = T)[[2]] # Group
+
+
+```
+
+------------------------------------------------------------------------
+
+# 9. Plot the MOFA factors by group
+
+MOFA factors are assigned to each sample observed by MOFA trained model. It describes for each sample the molecular variation pattern observed among the integrated data. The values are centred around zero; therefore, their absolute numerical values are less important than the relative positions of the samples. Samples with factor values close to `0.0` indicates that there is no consistent distinction among the samples observed in the respective latent factors.
+
+In this chunk of code, `factors = c(1,2)` produces separate panels for Factor 1, Factor 2 and Factor 3. The argument `color_by = "group"` colours the samples according to their predefined High, Low, and Medium boar-taint groups. This colouring is used for downstream interpretation and `does not mean that the groups were used as supervised outcomes when the factors were learned`.
+
+For Factor 1, the Low taint-group samples are concentrated around zero, whereas the High taint-group samples display greater dispersion. The Medium group includes both negative and positive factor values. For Factor 2, the High taint-group samples are mainly concentrated near zero, while the Low group contains negative factor values together with one strongly positive value. The Medium group spans from moderately negative to positive factor values. For Factor 3, heterogeneous variability is observed among individuals within each of the three taint groups, with the Low-taint group showing the widest distribution of factor values. As indicated by the previous plot, methylation features contribute more strongly to this variability than RNA-seq features, suggesting the presence of substantial inter-individual methylation differences within and across the taint groups. The differentiation between the RNA-seq and methylation views from the different observed groups highlighted in the previous analysis is also reflected in the distinct factor values assigned to the individual samples.
+
+```{r factor-plot}
+plot_factor(mofa_trained, 
+                 factors = 1:3,
+                 color_by = "group",
+                 dot_size = 3,        # change dot size
+                 dodge = T,           # dodge points with different colors
+                 legend = T,         
+                 add_violin = T,      
+                 violin_alpha = 0.25)
+
+
+
+```
+
+------------------------------------------------------------------------
+
+# 10. Plot Factor 1 against Factor 2 - Factor 1 against Factor 3
+
+Comparison of the factor scatter plots with the previous group-wise factor distributions confirms inter-individual variability within the three taint groups. Factor 1 primarily distinguishes samples from the High- and Medium-taint groups from the more tightly clustered Low-taint samples, with `H1306` showing the most distinct Factor 1 score among the High-taint individuals. Along Factor 2, the Low-taint samples display greater dispersion and therefore contribute prominently to the observed sample separation. The Factor 1 versus Factor 3 plot reveals a different structure. Although `H9138` and `H7107` were less differentiated along Factor 1, they occupy more distinct positions along Factor 3. This indicates that Factor 3 captures a source of molecular variability that differs from the variation represented by Factor 1. Based on the variance explained by each factor within each omics view, this Factor 3 pattern may be more strongly associated with methylation variability than with RNA-seq variability. 
+
+```{r factor-scatter}
+# factors scatter plot
+# Convert long to wide format
+factors_df <- get_factors(mofa_trained, factors = "all", as.data.frame = TRUE)
+
+factors_wide <- factors_df %>%
+  pivot_wider(names_from = factor, values_from = value)
+
+# Scatter plot F1 and F2
+ggplot(factors_wide, aes(x = Factor1, y = Factor2, color = group)) +
+  geom_point(size = 3) +
+  geom_text(aes(label = sample), vjust = -0.5, hjust = 0.5, size = 3) +  # sample labels above points
+  theme_minimal() +
+  labs(title = "MOFA Factor 1 vs Factor 2 by Group", color = "Group")
+
+# Scatter plot F1 and F3
+ggplot(factors_wide, aes(x = Factor1, y = Factor3, color = group)) +
+  geom_point(size = 3) +
+  geom_text(aes(label = sample), vjust = -0.5, hjust = 0.5, size = 3) +  # sample labels above points
+  theme_minimal() +
+  labs(title = "MOFA Factor 1 vs Factor 3 by Group", color = "Group")
+
+
+
+
+```
+
+------------------------------------------------------------------------
+
+# 11. Inspect RNA-seq feature weights for Factor 1
+
+In the following plot, Here we investigate the contribution of top features weights in RNA-seq omic modality in Factor 1. From a transcriptomic perspective, the top 5000 biomarkers were restricted to the top 10 features that explains the major differentiations observed across the groups :
+
+  - A positive weight means that the expression of gene (current observed biomarker) tends to be higher in samples with positive values of that factor and lower in samples with negative factor values.
+  - A negative weight means that its expression tends to be higher in samples with negative values of that factor and lower in samples with positive factor values.
+  - A weight close to zero indicates that the feature is weakly related to that factor.
+  - A larger absolute weight indicates a stronger relationship with the factor.
+  
+Respectively to the same interpretation approach, methylation data can be seen in the same method. For the top feature in Factor1, the accessibility of the methylation region `chr6_13663616` has a negative weight, indicating that its methylation is higher in samples observed on factors scores that have higher negative scores, compared to samples with positive factors. The observed weight of the feature is currently the highest, indicating a major contribution from the methylation modality in explaining intra-individual differentiation from the current observed biomarker. 
+To investigate other factors in intra-group/intra-individual differentiation, the flag `factor = 1` and `features = 10` can be edited for higher number of variable measurements and other latent factors observed.
+
+
+
+```{r rna-feature-weights}
+################
+
+# Identify Important Genes/CpGs for Each Factor
+plot_weights(mofa_trained,
+             view = "RNAseq",
+             factor = 1,
+             nfeatures = 10,     # Number of features to highlight
+             scale = T,          
+             abs = F             # Take the absolute value?
+)
+
+# Plot top absolute weights (most influential features regardless of direction)
+plot_top_weights(mofa_trained,
+                 view = "RNAseq",
+                 factor = 1,
+                 nfeatures = 10
+)
+
+
+```
+
+
+```{r methylation-feature-weights}
+#### Methylation 
+# Plot feature weights for Factor 1 in the Methylation view
+plot_weights(mofa_trained,
+             view = "Methylation",
+             factor = 1,
+             nfeatures = 10,     # Number of features to highlight
+             scale = T,          # Scale weights from -1 to 1
+             abs = F             # Take the absolute value?
+)
+
+# Plot top absolute weights (most influential features regardless of direction)
+plot_top_weights(mofa_trained,
+                 view = "Methylation",
+                 factor = 1,
+                 nfeatures = 10
+)
+
+
+```
+
+------------------------------------------------------------------------
+
+# 12. Relate the top RNA-seq feature to Factor 1-2-3 (Scatter plots)
+
+This analysis examines the relationship between the sample scores for Factor 1 and the expression values of the RNA-seq feature with the largest absolute weight on that factor. MOFA2 recommends plotting current observed feature (in this example plots, we take the highest weighted variable) values against factor scores to visualize the coordinated molecular variability captured by the model. A linear regression line can be added to assess whether the relationship between the selected feature and the latent factor is approximately linear.
+
+In this scatter plot, the x-axis represents the Factor 1 score and the y-axis represents the expression level of the selected RNA-seq feature. Samples are coloured according to their taint group. The fitted linear regression for each group is observed by the correlation between the feature selected (Top gene selected) to the Factor 1 score. 
+
+On the following plot, Latent factors capture major sources of variation across the different data modalities, and each individual is assigned a factor score that determines its position along the corresponding latent factor. Because the selected gene has a negative weight, its expression tends to be higher in samples with negative factor scores and lower in samples with positive factor scores, within this fitted model. To confirm these results, we have plotted another heatmap that investigates covariation patterns in the input matrices. In fact, by observing the gene `ENSSSCG00000018069` in the heatmap, it is quite observable the way how the gene expression distinguishes in between the 3 high-boar taints phenotype is.  
+
+```{r factor-feature-correlation-factor1}
+#######  Gene correlates with factor 1 component ###############################
+
+# Extract weights
+weights <- get_weights(mofa_trained, views = "RNAseq", factors = 1, as.data.frame = TRUE)
+#These weights represent how strongly each feature contributes to Factor 1
+
+top_genes <- get_weights(mofa_trained, 
+                         view = "RNAseq", 
+                         factor = 1, 
+                         as.data.frame = TRUE)
+
+top_feature <- top_genes[order(abs(top_genes$value), decreasing = TRUE), ]
+top_feature <- weights[order(-abs(weights$value)), "feature"][1]
+head(top_feature)
+# Extract factor scores
+factors <- get_factors(mofa_trained, factors = 1, as.data.frame = TRUE)
+
+# Extract feature expression
+data <- get_data(mofa_trained, view = "RNAseq", as.data.frame = TRUE)
+feature_data <- subset(data, as.character(feature) == as.character(top_feature))
+
+# Merge data
+df <- merge(factors, feature_data, by = "sample")
+df$group <- samples_metadata(mofa_trained)$group
+
+# Plot 
+ggplot(df, aes(x = value.x, y = value.y, color = group)) +
+  geom_point(size = 3) +
+  geom_smooth(method = "lm", se = FALSE) +
+  stat_cor(method = "pearson") +
+  labs(
+    x = "Factor 1 score",
+    y = paste("Expression of", top_feature)
+  ) +
+  theme_minimal()
+
+plot_data_heatmap(mofa_trained,
+  view = "RNAseq",         # view of interest
+  factor = 1,             # factor of interest
+  features = 10,          # number of features to plot (they are selected by weight)
+  
+  # extra arguments that are passed to the `pheatmap` function
+  cluster_rows = TRUE, cluster_cols = TRUE,
+  show_rownames = TRUE, show_colnames = TRUE
+)
+
+## Obseving the weight of the expressiong gene, the sign of it is negative. Which means: the expression of this gene is high
+## for samples that have negative factore score (value), and the expression of this gene seems to be lower for samples that have
+## positive factor score.
+
+```
+
+```{r factor-feature-correlation-factor2}
+#######  Gene correlates with factor 2 component ###############################
+
+# Extract weights
+weights <- get_weights(mofa_trained, views = "RNAseq", factors = 2, as.data.frame = TRUE)
+#These weights represent how strongly each feature contributes to Factor 1
+
+top_genes <- get_weights(mofa_trained, 
+                         view = "RNAseq", 
+                         factor = 2, 
+                         as.data.frame = TRUE)
+
+top_feature <- top_genes[order(abs(top_genes$value), decreasing = TRUE), ]
+top_feature <- weights[order(-abs(weights$value)), "feature"][1]
+head(top_feature)
+# Extract factor scores
+factors <- get_factors(mofa_trained, factors = 2, as.data.frame = TRUE)
+
+# Extract feature expression
+data <- get_data(mofa_trained, view = "RNAseq", as.data.frame = TRUE)
+feature_data <- subset(data, as.character(feature) == as.character(top_feature))
+
+# Merge data
+df <- merge(factors, feature_data, by = "sample")
+df$group <- samples_metadata(mofa_trained)$group
+
+# Plot 
+ggplot(df, aes(x = value.x, y = value.y, color = group)) +
+  geom_point(size = 3) +
+  geom_smooth(method = "lm", se = FALSE) +
+  stat_cor(method = "pearson") +
+  labs(
+    x = "Factor 2 score",
+    y = paste("Expression of", top_feature)
+  ) +
+  theme_minimal()
+
+plot_data_heatmap(mofa_trained,
+  view = "RNAseq",         # view of interest
+  factor = 2,             # factor of interest
+  features = 10,          # number of features to plot (they are selected by weight)
+  
+  # extra arguments that are passed to the `pheatmap` function
+  cluster_rows = TRUE, cluster_cols = TRUE,
+  show_rownames = TRUE, show_colnames = TRUE
+)
+
+
+```
+
+```{r factor-feature-correlation-factor3}
+#######  Gene correlates with factor 3 component ###############################
+
+# Extract weights
+weights <- get_weights(mofa_trained, views = "RNAseq", factors = 3, as.data.frame = TRUE)
+#These weights represent how strongly each feature contributes to Factor 1
+
+top_genes <- get_weights(mofa_trained, 
+                         view = "RNAseq", 
+                         factor = 3, 
+                         as.data.frame = TRUE)
+
+top_feature <- top_genes[order(abs(top_genes$value), decreasing = TRUE), ]
+top_feature <- weights[order(-abs(weights$value)), "feature"][1]
+head(top_feature)
+# Extract factor scores
+factors <- get_factors(mofa_trained, factors = 3, as.data.frame = TRUE)
+
+# Extract feature expression
+data <- get_data(mofa_trained, view = "RNAseq", as.data.frame = TRUE)
+feature_data <- subset(data, as.character(feature) == as.character(top_feature))
+
+# Merge data
+df <- merge(factors, feature_data, by = "sample")
+df$group <- samples_metadata(mofa_trained)$group
+
+# Plot 
+ggplot(df, aes(x = value.x, y = value.y, color = group)) +
+  geom_point(size = 3) +
+  geom_smooth(method = "lm", se = FALSE) +
+  stat_cor(method = "pearson") +
+  labs(
+    x = "Factor 3 score",
+    y = paste("Expression of", top_feature)
+  ) +
+  theme_minimal()
+
+plot_data_heatmap(mofa_trained,
+  view = "RNAseq",         # view of interest
+  factor = 3,             # factor of interest
+  features = 10,          # number of features to plot (they are selected by weight)
+  
+  # extra arguments that are passed to the `pheatmap` function
+  cluster_rows = TRUE, cluster_cols = TRUE,
+  show_rownames = TRUE, show_colnames = TRUE
+)
+
+
+
+```
+
+
+------------------------------------------------------------------------
+
+# 13. Visualize the top features driving Factor 1
+
+The violin plots display the observed values of the RNA-seq and methylation features with the largest absolute weights for Factor 1. These features are therefore the variables most strongly associated with the covariation pattern represented by this factor within their respective omics views. For the RNA-seq view, the plots show the normalized expression values of the selected genes across the three boar-taint groups. For the methylation view, they show methylation M-values. Some features display relatively similar values across the cohort, whereas others show pronounced differences among individuals or groups (All the group commonly different to the rest of the measured phenotypes categories, or individuals are different within the group). These patterns indicate inter-individual molecular variability associated with Factor 1.
+
+As a multivariate latent-factor approach, MOFA represents each omics modality as a linear combination of latent factors and feature-specific weights. This is conceptually related to PCA, which summarizes variation through linear principal components, but MOFA extends this framework to multiple data modalities. In fact, what we have presented in this tutorial is just a linear modelization of a unsupervised approach. MOFA can go beyond this by modelling also non-linear relationships. I would invite to read these 2 links about MOFA: `https://pmc.ncbi.nlm.nih.gov/articles/PMC6010767/` and `https://biofam.github.io/MOFA2/`.
+
+```{r top-factor-features}
+# Visualization of Top 30 Features Driving Latent Factor 1 in MOFA (RNA-Seq and Methylation)
+# Get latent factors (samples × factors)
+factors <- get_factors(mofa_trained, factors = "all")
+
+# Get feature weights for all views (features × factors)
+weights <- get_weights(mofa_trained, views = c("RNAseq", "Methylation"), factors = 1)
+
+# Top 30 genes with highest absolute weights in RNAseq
+top_genes <- sort(abs(weights$RNAseq[,1]), decreasing = TRUE)[1:30]
+top_genes_names <- names(top_genes)
+
+# Top 30 CpGs with highest absolute weights in Methylation
+top_cpgs <- sort(abs(weights$Methylation[,1]), decreasing = TRUE)[1:30]
+top_cpgs_names <- names(top_cpgs)
+
+# Get input data (long format)
+data <- get_data(mofa_trained, as.data.frame = TRUE)
+
+# Subset data for top features
+top_gene_data <- subset(data, feature %in% top_genes_names & view == "RNAseq")
+top_cpg_data <- subset(data, feature %in% top_cpgs_names & view == "Methylation")
+
+
+# Plot Genes
+ggplot(top_gene_data, aes(x = group, y = value, fill = group)) +
+  geom_violin(alpha = 1) +
+  geom_jitter(width = 0.2, size = 1) +
+  facet_wrap(~ feature, scales = "free_y") +
+  theme_minimal() +
+  labs(title = "Top 30 Genes by MOFA Factor 1",
+       y = "Expression", x = "Boar Taint Group")
+
+##### For CPGs 
+ggplot(top_cpg_data, aes(x = group, y = value, fill = group)) +
+  geom_violin(alpha = 1) +
+  geom_jitter(width = 0.2, size = 1) +
+  facet_wrap(~ feature, scales = "free_y") +
+  theme_minimal() +
+  labs(title = "Top 30 CPGs by MOFA Factor 1",
+       y = "M-value (Log)", x = "Boar Taint Group")
+
+
+```
+# 14. Acknowledgement
+
+Special thanks to the PhD student Pratik Pandurang for sharing the original data, and some parts of the script. Major changes in the script was done by Adam El Idrissi. Special thanks to the core team of MOFA2 for building this amazing integration software.
+
+For any further questions, feel free to contact me in the following contacts: Email: [adam.elidrissi\@unicatt.it](mailto:adam.elidrissi@unicatt.it){.email} - [tnewnis2\@gmail.com](mailto:tnewnis2@gmail.com){.email}
